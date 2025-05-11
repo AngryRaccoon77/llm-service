@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from langchain.llms import LlamaCpp
 from langchain.tools import Tool
@@ -6,11 +6,16 @@ from langchain.agents import initialize_agent, AgentType
 from langchain_core.exceptions import OutputParserException
 import requests
 import os
+import logging
 
-# Путь к модели GGUF
-model_path = "D:/model/aovchinnikov/T-lite-it-1.0-Q4_K_M-GGUF/t-lite-it-1.0-q4_k_m.gguf"
+# === Настройка логирования ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Инициализация LlamaCpp
+# === Путь к модели GGUF ===
+model_path = "/Users/enterprise/Downloads/t-lite-it-1.0-q4_k_m.gguf"
+
+# === Инициализация LLM ===
 llm = LlamaCpp(
     model_path=model_path,
     n_gpu_layers=14,
@@ -20,12 +25,12 @@ llm = LlamaCpp(
     verbose=True
 )
 
-# Получение API-ключа из переменных окружения
+# === API ключ OpenWeather ===
 API_KEY = "5c505f2649e1d6117484321b4f107816"
 if not API_KEY:
-    raise ValueError("API-ключ OpenWeather не найден. Установите переменную окружения OPENWEATHER_API_KEY.")
+    raise ValueError("API-ключ OpenWeather не найден.")
 
-# Функция для получения погоды
+# === Функция получения погоды ===
 def get_weather(city: str) -> str:
     base_url = "http://api.openweathermap.org/data/2.5/weather"
     params = {
@@ -43,60 +48,43 @@ def get_weather(city: str) -> str:
         weather = data["weather"][0]["description"]
         temp = data["main"]["temp"]
         return f"Текущая погода в {city}: {weather}, температура {temp}°C"
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         return f"Ошибка при получении данных о погоде: {str(e)}"
 
 
+# === Функция поиска в Qdrant через RAG сервис ===
 def search_db(query: str, query_ngql: str = None) -> str:
-    """
-    Отправляет запрос к сервису базы данных через HTTP POST
-    """
-    service_url = "http://localhost:8081/search"
-
+    service_url = "http://localhost:8086/rag/process"
     try:
-        # Отправляем POST-запрос с параметрами
         response = requests.post(
             service_url,
-            json={
-                "query": query,
-                "query_ngql": query_ngql
-            },
-            timeout=10  # Таймаут 10 секунд
+            json={"query": query},
+            timeout=10
         )
-
-        # Проверяем статус код
         response.raise_for_status()
 
-        # Парсим JSON ответ
-        result = response.json()
+        # Парсим JSON и получаем результат
+        data = response.json()
+        return data.get("result", "")
 
-        # Проверяем наличие ожидаемых данных в ответе
-        if "result" in result:
-            return result["result"]
-        else:
-            return "Получен неожиданный формат ответа от сервиса"
-
-    except requests.exceptions.RequestException as e:
-        # Обрабатываем ошибки соединения
-        return f"Ошибка соединения с сервисом: {str(e)}"
     except Exception as e:
-        # Общие ошибки
-        return f"Ошибка при обработке запроса: {str(e)}"
+        logger.error(f"Ошибка при обращении к RAG-сервису: {e}")
+        return f"Ошибка при работе с RAG-сервисом: {str(e)}"
 
-# Создание инструмента
+# === Инструменты ===
 weather_tool = Tool(
     name="get_weather",
     func=get_weather,
-    description="Получает текущую погоду в указанном городе с использованием API OpenWeather."
+    description="Получает текущую погоду в указанном городе."
 )
 
 search_db_tool = Tool(
     name="search_db",
     func=search_db,
-    description="Поиск в векторной базе данных qdrant и knowledge graph nebula с помощью ngql."
+    description="Поиск в векторной базе данных qdrant с помощью RAG сервиса."
 )
 
-# Инициализация агента
+# === Агент ===
 agent = initialize_agent(
     tools=[weather_tool, search_db_tool],
     llm=llm,
@@ -104,28 +92,52 @@ agent = initialize_agent(
     verbose=True
 )
 
-# Функция для взаимодействия с агентом
-def ask_question(question):
-    try:
-        response = agent.run(question)
-    except OutputParserException as e:
-        try:
-            response = str(e).split("Could not parse LLM output: `")[1].split("`")[0]
-        except IndexError:
-            response = "Извините, не удалось обработать ваш запрос."
-    return response
 
-# FastAPI приложение
-app = FastAPI()
-
-class Question(BaseModel):
+# === Модель для входных данных ===
+class QuestionRequest(BaseModel):
     question: str
 
+
+# === FastAPI ===
+app = FastAPI()
+
+class RagRequest(BaseModel):
+    query: str
+
+
+@app.post("/rag-process")
+def rag_process(request: RagRequest):
+    try:
+        # Запускаем агент с RAG инструментом
+        answer = agent.run(request.query)
+        return {"response": answer}
+    except OutputParserException as e:
+        try:
+            answer = str(e).split("Could not parse LLM output: `")[1].split("`")[0]
+            return {"response": answer}
+        except IndexError:
+            return {"error": "Извините, не удалось обработать ваш запрос."}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/ask")
-async def ask(question: Question):
-    answer = ask_question(question.question)
-    return {"answer": answer}
+async def ask(request: QuestionRequest):
+    try:
+        answer = agent.run(request.question)
+        return {"answer": answer}
+    except OutputParserException as e:
+        logger.warning(f"OutputParserException: {e}")
+        try:
+            answer = str(e).split("Could not parse LLM output: `")[1].split("`")[0]
+            return {"answer": answer}
+        except IndexError:
+            return {"error": "Извините, не удалось обработать ваш запрос."}
+    except Exception as e:
+        logger.error(f"Ошибка при обработке запроса: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# === Точка входа ===
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8084)
