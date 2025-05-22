@@ -75,7 +75,11 @@ def search_db(query: str, query_ngql: str = None) -> str:
         )
         response.raise_for_status()
         data = response.json()
-        return data.get("result", "")
+        retriever_response = data.get("result", "")
+        if llm.get_num_tokens(retriever_response) > 1800:
+            prompt = f"Суммаризируй следующий текст в нескольких предложениях: {retriever_response}"
+            retriever_response = llm(prompt, max_tokens=200)
+        return retriever_response
     except Exception as e:
         logger.error(f"Ошибка при обращении к RAG-сервису: {e}")
         return f"Ошибка при работе с RAG-сервисом: {str(e)}"
@@ -102,6 +106,13 @@ class ChatRequest(BaseModel):
     chat_id: str
     query: str
 
+
+
+class TokenCountRequest(BaseModel):
+    text: str
+
+class SummarizeRequest(BaseModel):
+    text: str
 @app.post("/chat")
 async def chat(request: ChatRequest):
     try:
@@ -140,6 +151,7 @@ async def chat(request: ChatRequest):
     except Exception as e:
         logger.error(f"Ошибка при обработке запроса: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
